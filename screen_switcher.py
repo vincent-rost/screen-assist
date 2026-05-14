@@ -26,6 +26,7 @@ import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -40,14 +41,6 @@ LAUNCH_AGENT_PATH = (
 )
 LOG_PATH = APP_DIR / "screen_switcher.log"
 
-EXTERNAL_ID = "DD110D51-7707-4A87-98E1-AEAA88626864"
-MACBOOK_ID = "37D8832A-2D66-02CA-B9F7-8F30A301B230"
-
-EXTERNAL_BASE = (
-    f"id:{EXTERNAL_ID} res:1920x1080 hz:60 color_depth:8 "
-    "enabled:true scaling:off origin:(0,0) degree:0"
-)
-
 DEFAULTS: dict = {
     "above_macbook_x": 278,
     "right_macbook_y": 124,
@@ -56,6 +49,159 @@ DEFAULTS: dict = {
 
 ABOVE_X_RANGE = (-500, 1000)
 RIGHT_Y_RANGE = (-300, 500)
+
+
+# ===== display detection ================================================
+
+@dataclass
+class Display:
+    """One physical screen as reported by `displayplacer list`."""
+    persistent_id: str
+    kind: str                  # "builtin" | "external"
+    resolution: tuple[int, int]
+    hertz: int
+    color_depth: int
+    scaling: bool              # True if "Scaling: on"
+    enabled: bool
+    origin: tuple[int, int] = (0, 0)
+
+    @property
+    def width(self) -> int:
+        return self.resolution[0]
+
+    @property
+    def height(self) -> int:
+        return self.resolution[1]
+
+    def to_arg(self, origin: tuple[int, int]) -> str:
+        """Build a displayplacer per-screen argument with the given origin."""
+        scaling = "on" if self.scaling else "off"
+        return (
+            f"id:{self.persistent_id} "
+            f"res:{self.width}x{self.height} hz:{self.hertz} "
+            f"color_depth:{self.color_depth} enabled:true "
+            f"scaling:{scaling} origin:({origin[0]},{origin[1]}) degree:0"
+        )
+
+
+@dataclass
+class DisplaySet:
+    """The currently connected displays, split by kind."""
+    builtin: Display | None = None
+    externals: list[Display] = field(default_factory=list)
+
+    @property
+    def external(self) -> Display | None:
+        """Primary external — first non-builtin display, if any."""
+        return self.externals[0] if self.externals else None
+
+    @property
+    def signature(self) -> tuple:
+        """Stable key that changes when the connected display set changes.
+
+        Used for hot-plug detection.
+        """
+        b = self.builtin.persistent_id if self.builtin else None
+        return (b, tuple(d.persistent_id for d in self.externals))
+
+    @property
+    def is_ready(self) -> bool:
+        """True when we have both a built-in and at least one external."""
+        return self.builtin is not None and self.external is not None
+
+
+_BUILTIN_TYPE_HINTS = ("MacBook", "built in", "built-in", "builtin")
+
+
+def _displayplacer_list() -> str | None:
+    """Run `displayplacer list` and return stdout, or None on failure."""
+    try:
+        return subprocess.run(
+            ["displayplacer", "list"],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout
+    except Exception:
+        return None
+
+
+def parse_displays(output: str) -> DisplaySet:
+    """Parse `displayplacer list` output into a DisplaySet."""
+    ds = DisplaySet()
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for raw in output.splitlines():
+        if raw.startswith("Persistent screen id:"):
+            if current:
+                blocks.append(current)
+            current = [raw]
+        elif current is not None:
+            current.append(raw)
+    if current:
+        blocks.append(current)
+
+    for block in blocks:
+        fields: dict[str, str] = {}
+        for line in block:
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            fields[key.strip()] = val.strip()
+
+        pid = fields.get("Persistent screen id", "")
+        if not pid:
+            continue
+
+        type_str = fields.get("Type", "")
+        kind = "builtin" if any(h in type_str for h in _BUILTIN_TYPE_HINTS) else "external"
+
+        res_match = re.match(r"(\d+)x(\d+)", fields.get("Resolution", ""))
+        if not res_match:
+            continue
+        res = (int(res_match.group(1)), int(res_match.group(2)))
+
+        try:
+            hz = int(fields.get("Hertz", "60"))
+        except ValueError:
+            hz = 60
+        try:
+            depth = int(fields.get("Color Depth", "8"))
+        except ValueError:
+            depth = 8
+
+        scaling = fields.get("Scaling", "off").lower() == "on"
+        enabled = fields.get("Enabled", "true").lower() == "true"
+
+        origin = (0, 0)
+        om = re.search(r"\((-?\d+),\s*(-?\d+)\)", fields.get("Origin", ""))
+        if om:
+            origin = (int(om.group(1)), int(om.group(2)))
+
+        d = Display(
+            persistent_id=pid,
+            kind=kind,
+            resolution=res,
+            hertz=hz,
+            color_depth=depth,
+            scaling=scaling,
+            enabled=enabled,
+            origin=origin,
+        )
+        if kind == "builtin" and ds.builtin is None:
+            ds.builtin = d
+        elif kind == "external":
+            ds.externals.append(d)
+
+    # Stable ordering so signature is deterministic across polls.
+    ds.externals.sort(key=lambda d: d.persistent_id)
+    return ds
+
+
+def find_displays() -> DisplaySet:
+    """Detect currently connected displays. Returns an empty set on failure."""
+    out = _displayplacer_list()
+    if out is None:
+        return DisplaySet()
+    return parse_displays(out)
 
 
 # ===== settings ==========================================================
@@ -85,49 +231,81 @@ def save_settings(s: dict) -> None:
 
 # ===== layouts & displayplacer ==========================================
 
-def make_layouts(settings: dict) -> dict:
+LAYOUT_META: dict = {
+    "above": {
+        "title": "Above",
+        "subtitle": "External screen sits above the MacBook",
+        "fine_tune": {
+            "label": "Horizontal alignment",
+            "value_label": "MacBook x-offset",
+            "settings_key": "above_macbook_x",
+            "range": ABOVE_X_RANGE,
+            "left_hint": "MacBook left",
+            "right_hint": "MacBook right",
+        },
+    },
+    "right": {
+        "title": "Right",
+        "subtitle": "External screen sits to the right of the MacBook",
+        "fine_tune": {
+            "label": "Vertical alignment",
+            "value_label": "MacBook y-offset",
+            "settings_key": "right_macbook_y",
+            "range": RIGHT_Y_RANGE,
+            "left_hint": "MacBook higher",
+            "right_hint": "MacBook lower",
+        },
+    },
+}
+
+
+def make_layouts(settings: dict, displays: DisplaySet | None = None) -> dict:
+    """Build the layouts dict for the current display set.
+
+    Returns an empty dict if no usable built-in + external pair is connected.
+    Display geometry (resolution, hz, scaling, …) is read from the actually
+    connected screens — nothing is hardcoded.
+    """
+    if displays is None:
+        displays = find_displays()
+    if not displays.is_ready:
+        return {}
+
+    builtin = displays.builtin
+    external = displays.external
+    assert builtin is not None and external is not None
+
     return {
         "above": {
-            "title": "Above",
-            "subtitle": "External screen sits above the MacBook",
-            "fine_tune": {
-                "label": "Horizontal alignment",
-                "value_label": "MacBook x-offset",
-                "settings_key": "above_macbook_x",
-                "range": ABOVE_X_RANGE,
-                "left_hint": "MacBook left",
-                "right_hint": "MacBook right",
-            },
+            **LAYOUT_META["above"],
             "args": [
-                EXTERNAL_BASE,
-                f"id:{MACBOOK_ID} res:1470x956 hz:60 color_depth:8 "
-                f"enabled:true scaling:on "
-                f"origin:({settings['above_macbook_x']},1080) degree:0",
+                external.to_arg((0, 0)),
+                builtin.to_arg((settings["above_macbook_x"], external.height)),
             ],
         },
         "right": {
-            "title": "Right",
-            "subtitle": "External screen sits to the right of the MacBook",
-            "fine_tune": {
-                "label": "Vertical alignment",
-                "value_label": "MacBook y-offset",
-                "settings_key": "right_macbook_y",
-                "range": RIGHT_Y_RANGE,
-                "left_hint": "MacBook higher",
-                "right_hint": "MacBook lower",
-            },
+            **LAYOUT_META["right"],
             "args": [
-                EXTERNAL_BASE,
-                f"id:{MACBOOK_ID} res:1470x956 hz:60 color_depth:8 "
-                f"enabled:true scaling:on "
-                f"origin:(-1470,{settings['right_macbook_y']}) degree:0",
+                external.to_arg((0, 0)),
+                builtin.to_arg((-builtin.width, settings["right_macbook_y"])),
             ],
         },
     }
 
 
-def apply_layout(settings: dict, name: str) -> tuple[bool, str]:
-    layouts = make_layouts(settings)
+def apply_layout(
+    settings: dict, name: str, displays: DisplaySet | None = None
+) -> tuple[bool, str]:
+    if displays is None:
+        displays = find_displays()
+    if not displays.is_ready:
+        if displays.builtin is None and not displays.externals:
+            return False, "No displays detected (is displayplacer installed?)."
+        if displays.external is None:
+            return False, "No external display connected."
+        return False, "Built-in display not detected."
+
+    layouts = make_layouts(settings, displays)
     if name not in layouts:
         return False, f"Unknown layout: {name}"
     try:
@@ -149,38 +327,30 @@ def apply_layout(settings: dict, name: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-def detect_state() -> tuple[str | None, int | None, int | None]:
+def detect_state(
+    displays: DisplaySet | None = None,
+) -> tuple[str | None, int | None, int | None]:
     """Return (layout_name, mb_x, mb_y).
 
-    layout_name is "above", "right", "custom" or None on error.
+    layout_name is "above", "right", "custom" or None on error / no external.
+    Origin thresholds are derived from the actual screen geometry, so this
+    works with any combination of MacBook + external (not just 1080p).
     """
-    try:
-        out = subprocess.run(
-            ["displayplacer", "list"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        ).stdout
-    except Exception:
+    if displays is None:
+        displays = find_displays()
+    if not displays.is_ready:
         return None, None, None
 
-    in_mb = False
-    for line in out.splitlines():
-        if MACBOOK_ID in line:
-            in_mb = True
-            continue
-        if in_mb and line.startswith("Origin:"):
-            m = re.search(r"\((-?\d+),(-?\d+)\)", line)
-            if not m:
-                return None, None, None
-            x, y = int(m.group(1)), int(m.group(2))
-            if y >= 1000:
-                return "above", x, y
-            if x <= -1000:
-                return "right", x, y
-            return "custom", x, y
-    return None, None, None
+    builtin = displays.builtin
+    external = displays.external
+    assert builtin is not None and external is not None
+
+    x, y = builtin.origin
+    if y >= external.height // 2:
+        return "above", x, y
+    if x <= -builtin.width // 2:
+        return "right", x, y
+    return "custom", x, y
 
 
 # ===== hotkey utilities ==================================================
@@ -193,6 +363,45 @@ MOD_DISPLAY = {
 }
 
 MOD_ORDER = ["ctrl", "alt", "shift", "cmd"]
+
+# Tk keysyms for modifier keys (mapped to pynput hotkey names).
+HELD_MOD_KEYSYMS = {
+    "Control_L": "ctrl", "Control_R": "ctrl",
+    "Shift_L": "shift", "Shift_R": "shift",
+    "Alt_L": "alt", "Alt_R": "alt",
+    "Option_L": "alt", "Option_R": "alt",
+    "Meta_L": "cmd", "Meta_R": "cmd",
+    "Command_L": "cmd", "Command_R": "cmd",
+    "Super_L": "cmd", "Super_R": "cmd",
+}
+
+# Multi-character Tk keysyms that map to pynput Key enum names.
+# (Tk uses X11 legacy keysyms: "Prior" = page up, "Next" = page down.)
+SPECIAL_KEYSYMS = {
+    "Escape": "esc",
+    "Return": "enter",
+    "BackSpace": "backspace",
+    "Tab": "tab",
+    "space": "space",
+    "Delete": "delete",
+    "Insert": "insert",
+    "Up": "up", "Down": "down", "Left": "left", "Right": "right",
+    "Home": "home", "End": "end",
+    "Prior": "page_up", "Next": "page_down",
+    "Page_Up": "page_up", "Page_Down": "page_down",
+    "Caps_Lock": "caps_lock",
+    "Num_Lock": "num_lock",
+    "Scroll_Lock": "scroll_lock",
+    "Pause": "pause",
+    "Print": "print_screen",
+    "Menu": "menu",
+    **{f"F{i}": f"f{i}" for i in range(1, 21)},
+}
+
+NUMPAD_CHARS = {
+    "KP_Add": "+", "KP_Subtract": "-", "KP_Multiply": "*",
+    "KP_Divide": "/", "KP_Decimal": ".", "KP_Equal": "=",
+}
 
 
 def pretty_hotkey(hk: str) -> str:
@@ -208,6 +417,64 @@ def pretty_hotkey(hk: str) -> str:
         else:
             out.append(part.upper())
     return "".join(out)
+
+
+def keysym_to_token(keysym: str) -> str | None:
+    """Translate a Tk keysym to a pynput hotkey token, or None if unsupported."""
+    if keysym in SPECIAL_KEYSYMS:
+        return f"<{SPECIAL_KEYSYMS[keysym]}>"
+
+    if keysym.startswith("KP_"):
+        rest = keysym[3:]
+        if rest.isdigit():
+            return rest
+        if keysym in NUMPAD_CHARS:
+            return NUMPAD_CHARS[keysym]
+        if rest == "Enter":
+            return "<enter>"
+        if rest == "Space":
+            return "space"
+        return None
+
+    if len(keysym) == 1:
+        return keysym.lower()
+
+    return None
+
+
+def validate_hotkey(hk: str) -> tuple[bool, str]:
+    """Return (ok, error_message) by attempting to parse with pynput."""
+    try:
+        from pynput.keyboard import HotKey
+        HotKey.parse(hk)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def build_hotkey_from_event(
+    keysym: str, held_mods: list[str]
+) -> tuple[str | None, str]:
+    """Build a pynput hotkey string from a Tk keysym + held modifier list.
+
+    Returns (hotkey, error). On success, hotkey is the parsed combo and error
+    is "". On failure, hotkey is None and error is a human-readable reason.
+    """
+    key_token = keysym_to_token(keysym)
+    if key_token is None:
+        return None, f"Unsupported key: {keysym!r}"
+
+    mods = sorted(
+        set(held_mods),
+        key=lambda m: MOD_ORDER.index(m) if m in MOD_ORDER else 99,
+    )
+    mod_str = "+".join(f"<{m}>" for m in mods)
+    hk = f"{mod_str}+{key_token}" if mod_str else key_token
+
+    ok, err = validate_hotkey(hk)
+    if not ok:
+        return None, err
+    return hk, ""
 
 
 # ===== launch agent ======================================================
@@ -305,7 +572,8 @@ def restart_launch_agent() -> tuple[bool, str]:
 
 def print_status() -> None:
     s = load_settings()
-    layout, mb_x, mb_y = detect_state()
+    displays = find_displays()
+    layout, mb_x, mb_y = detect_state(displays)
 
     def hdr(text: str) -> None:
         print(f"\n\033[1m{text}\033[0m")
@@ -317,14 +585,29 @@ def print_status() -> None:
     print(f"  hotkey:          {s['hotkey'] or '(not set)'}  "
           f"({pretty_hotkey(s['hotkey']) or 'n/a'})")
 
-    hdr("Display")
-    if layout in ("above", "right"):
-        print(f"  layout: {layout}")
-        print(f"  MacBook origin: ({mb_x}, {mb_y})")
-    elif layout == "custom":
-        print(f"  layout: custom (MacBook origin {mb_x}, {mb_y})")
-    else:
+    hdr("Displays")
+    if displays.builtin is None and not displays.externals:
         print("  could not read displays (is displayplacer installed?)")
+    else:
+        if displays.builtin:
+            b = displays.builtin
+            print(f"  built-in:  {b.persistent_id}  "
+                  f"{b.width}x{b.height} @ {b.hertz} Hz")
+        else:
+            print("  built-in:  (not detected)")
+        if displays.externals:
+            for i, e in enumerate(displays.externals):
+                mark = " (active)" if i == 0 else ""
+                print(f"  external:  {e.persistent_id}  "
+                      f"{e.width}x{e.height} @ {e.hertz} Hz{mark}")
+        else:
+            print("  external:  (none connected)")
+        if layout in ("above", "right"):
+            print(f"  layout:    {layout}  (MacBook origin {mb_x}, {mb_y})")
+        elif layout == "custom":
+            print(f"  layout:    custom (MacBook origin {mb_x}, {mb_y})")
+        elif displays.is_ready:
+            print("  layout:    unknown")
 
     hdr("Permissions")
     print(f"  Accessibility trust: "
@@ -460,30 +743,44 @@ def run_menu_bar_app() -> None:
         sys.exit("pynput not installed. Run: ./setup.sh")
 
     LAYOUT_GLYPH = {"above": "\u25b2", "right": "\u25b6"}  # ▲ ▶
+    NO_EXTERNAL_GLYPH = "\u25ab"  # ▫
+    DISPLAY_ERROR_GLYPH = "?"
 
     class MenuApp(rumps.App):
         def __init__(self) -> None:
             self.settings = load_settings()
-            current, _, _ = detect_state()
+            self.displays = find_displays()
+
+            current, _, _ = detect_state(self.displays)
             self.current = current if current in ("above", "right") else "above"
+
+            # Pick an initial title based on the detected state (inlined here
+            # because `_title_for_state` must not run before `super().__init__`).
+            if self.displays.builtin is None and not self.displays.externals:
+                init_title = DISPLAY_ERROR_GLYPH
+            elif not self.displays.is_ready:
+                init_title = NO_EXTERNAL_GLYPH
+            else:
+                init_title = LAYOUT_GLYPH.get(self.current, "?")
 
             super().__init__(
                 "ScreenSwitcher",
-                title=LAYOUT_GLYPH.get(self.current, "?"),
+                title=init_title,
                 quit_button=None,
             )
 
+            self.display_item = rumps.MenuItem("Displays: \u2026")
+            self.display_item.set_callback(None)
             self.above_item = rumps.MenuItem(
                 "Above", callback=lambda _: self._enqueue(self._set_layout, "above")
             )
             self.right_item = rumps.MenuItem(
                 "Right", callback=lambda _: self._enqueue(self._set_layout, "right")
             )
-            self.toggle_item = rumps.MenuItem(
-                "Toggle", callback=lambda _: self._enqueue(self._toggle)
+            self.hotkey_item = rumps.MenuItem(
+                "Toggle hotkey: \u2026",
+                callback=lambda _: self._open_recorder(),
             )
-            self.hotkey_item = rumps.MenuItem("Hotkey: …")
-            self.hotkey_item.set_callback(None)
             self.settings_item = rumps.MenuItem(
                 "Settings\u2026", callback=lambda _: self._open_settings()
             )
@@ -492,10 +789,11 @@ def run_menu_bar_app() -> None:
             )
 
             self.menu = [
+                self.display_item,
+                None,
                 self.above_item,
                 self.right_item,
                 None,
-                self.toggle_item,
                 self.hotkey_item,
                 None,
                 self.settings_item,
@@ -505,6 +803,7 @@ def run_menu_bar_app() -> None:
 
             self._pending: list = []
             self.hotkey_listener: keyboard.GlobalHotKeys | None = None
+            self._display_signature = self.displays.signature
 
             self._refresh_menu()
             self._last_settings_mtime = self._mtime()
@@ -552,10 +851,51 @@ def run_menu_bar_app() -> None:
                 self._refresh_menu()
                 self._restart_hotkey_listener()
 
-            current, _, _ = detect_state()
+            displays = find_displays()
+            sig = displays.signature
+            if sig != self._display_signature:
+                self._on_displays_changed(displays)
+            else:
+                self.displays = displays
+
+            current, _, _ = detect_state(self.displays)
             if current in ("above", "right") and current != self.current:
                 self.current = current
                 self._refresh_menu()
+
+        def _on_displays_changed(self, displays: "DisplaySet") -> None:
+            """Hot-plug: a screen was connected or disconnected."""
+            prev = self.displays
+            self.displays = displays
+            self._display_signature = displays.signature
+
+            prev_ext_ids = {d.persistent_id for d in prev.externals}
+            new_ext_ids = {d.persistent_id for d in displays.externals}
+            added = new_ext_ids - prev_ext_ids
+            removed = prev_ext_ids - new_ext_ids
+
+            if added:
+                ext = displays.external
+                desc = (
+                    f"{ext.width}\u00d7{ext.height} @ {ext.hertz} Hz"
+                    if ext else "external display"
+                )
+                rumps.notification(
+                    "Screen Switcher",
+                    "Display connected",
+                    f"Now using {desc}. Layouts updated.",
+                )
+            elif removed and not displays.external:
+                rumps.notification(
+                    "Screen Switcher",
+                    "External display disconnected",
+                    "Layouts are disabled until an external is reconnected.",
+                )
+
+            current, _, _ = detect_state(self.displays)
+            if current in ("above", "right"):
+                self.current = current
+            self._refresh_menu()
 
         def _tick_trust(self, _timer) -> None:
             """If the user just granted Accessibility, start the listener."""
@@ -567,21 +907,53 @@ def run_menu_bar_app() -> None:
                     f"Toggle with {pretty_hotkey(self.settings.get('hotkey', ''))}",
                 )
 
+        def _title_for_state(self) -> str:
+            if self.displays.builtin is None and not self.displays.externals:
+                return DISPLAY_ERROR_GLYPH
+            if not self.displays.is_ready:
+                return NO_EXTERNAL_GLYPH
+            return LAYOUT_GLYPH.get(self.current, "?")
+
+        def _display_summary(self) -> str:
+            ext = self.displays.external
+            if ext is None:
+                if self.displays.builtin is None:
+                    return "Displays: (none detected)"
+                return "Displays: built-in only"
+            extra = ""
+            if len(self.displays.externals) > 1:
+                extra = f" (+{len(self.displays.externals) - 1} more)"
+            return (
+                f"External: {ext.width}\u00d7{ext.height} "
+                f"@ {ext.hertz} Hz{extra}"
+            )
+
         def _refresh_menu(self) -> None:
-            self.title = LAYOUT_GLYPH.get(self.current, "?")
-            self.above_item.state = 1 if self.current == "above" else 0
-            self.right_item.state = 1 if self.current == "right" else 0
+            self.title = self._title_for_state()
+            ready = self.displays.is_ready
+
+            self.above_item.state = 1 if ready and self.current == "above" else 0
+            self.right_item.state = 1 if ready and self.current == "right" else 0
+
+            self.above_item.set_callback(
+                (lambda _: self._enqueue(self._set_layout, "above")) if ready else None
+            )
+            self.right_item.set_callback(
+                (lambda _: self._enqueue(self._set_layout, "right")) if ready else None
+            )
+
+            self.display_item.title = self._display_summary()
+
             hk = self.settings.get("hotkey", "")
             pretty = pretty_hotkey(hk)
             self.hotkey_item.title = (
-                f"Hotkey: {pretty}" if pretty else "Hotkey: (not set)"
+                f"Toggle hotkey: {pretty}" if pretty else "Set toggle hotkey\u2026"
             )
-            self.toggle_item.title = f"Toggle  {pretty}" if pretty else "Toggle"
 
         # -- actions ---------------------------------------------------
 
         def _set_layout(self, name: str) -> None:
-            ok, msg = apply_layout(self.settings, name)
+            ok, msg = apply_layout(self.settings, name, self.displays)
             if ok:
                 self.current = name
                 self._refresh_menu()
@@ -591,11 +963,24 @@ def run_menu_bar_app() -> None:
                 )
 
         def _toggle(self) -> None:
+            if not self.displays.is_ready:
+                rumps.notification(
+                    "Screen Switcher",
+                    "No external display",
+                    "Connect an external display to toggle layouts.",
+                )
+                return
             self._set_layout("right" if self.current == "above" else "above")
 
         def _open_settings(self) -> None:
             subprocess.Popen(
                 [venv_python(), str(APP_DIR / "screen_switcher.py"), "--config"]
+            )
+
+        def _open_recorder(self) -> None:
+            subprocess.Popen(
+                [venv_python(), str(APP_DIR / "screen_switcher.py"),
+                 "--record-hotkey"]
             )
 
         def _quit(self) -> None:
@@ -633,6 +1018,130 @@ def run_menu_bar_app() -> None:
     MenuApp().run()
 
 
+# ===== hotkey recorder window ============================================
+
+def run_hotkey_recorder() -> None:
+    """Open a small modal Tk window that records a single hotkey combination
+    and writes it to ~/.screen_switcher.json. The running menu bar app picks
+    up the change automatically via its settings-file mtime poll.
+
+    Buttons:
+      - Clear  → unbinds the hotkey
+      - Cancel / Esc → close without saving
+
+    Recording starts immediately on open.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except ImportError:
+        sys.exit("tkinter not available. brew install python-tk@3.14")
+
+    class Recorder(tk.Tk):
+        PAD = 18
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.title("Screen Switcher \u2014 Toggle hotkey")
+            self.geometry("420x200")
+            self.resizable(False, False)
+            self.attributes("-topmost", True)
+            self.after(100, lambda: self.attributes("-topmost", False))
+
+            self.settings = load_settings()
+            self._held_mods: list[str] = []
+
+            style = ttk.Style(self)
+            try:
+                style.theme_use("aqua")
+            except tk.TclError:
+                pass
+            style.configure("Title.TLabel", font=("SF Pro Display", 14, "bold"))
+            style.configure("Sub.TLabel", font=("SF Pro Text", 11), foreground="#666")
+            style.configure("HotKey.TLabel", font=("SF Mono", 22, "bold"))
+            style.configure("Hint.TLabel", font=("SF Pro Text", 10), foreground="#888")
+
+            outer = ttk.Frame(self, padding=self.PAD)
+            outer.pack(fill="both", expand=True)
+
+            ttk.Label(outer, text="Press the keys for your toggle hotkey",
+                      style="Title.TLabel").pack(anchor="w")
+            ttk.Label(
+                outer,
+                text="Combine modifiers (\u2318/\u2325/\u2303/\u21e7) with one key. "
+                     "Esc cancels.",
+                style="Sub.TLabel", wraplength=380, justify="left",
+            ).pack(anchor="w", pady=(2, 12))
+
+            current = pretty_hotkey(self.settings.get("hotkey", ""))
+            self.hk_var = tk.StringVar(value=current or "\u2026 press keys")
+            ttk.Label(outer, textvariable=self.hk_var,
+                      style="HotKey.TLabel").pack(anchor="center", pady=(0, 8))
+
+            self.status_var = tk.StringVar(
+                value=(f"Current: {current}  \u2014  press a new combo to replace"
+                       if current else "Recording\u2026 press your key combo.")
+            )
+            ttk.Label(outer, textvariable=self.status_var,
+                      style="Hint.TLabel", wraplength=380,
+                      justify="center").pack(anchor="center")
+
+            btns = ttk.Frame(outer)
+            btns.pack(side="bottom", fill="x", pady=(12, 0))
+            ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+            ttk.Button(btns, text="Clear",
+                       command=self._clear).pack(side="right", padx=(0, 6))
+
+            self.bind_all("<KeyPress>", self._on_keypress)
+            self.bind_all("<KeyRelease>", self._on_keyrelease)
+            self.focus_force()
+
+        def _on_keypress(self, event):
+            sym = event.keysym
+            if sym in HELD_MOD_KEYSYMS:
+                mod = HELD_MOD_KEYSYMS[sym]
+                if mod not in self._held_mods:
+                    self._held_mods.append(mod)
+                return "break"
+
+            if sym == "Escape":
+                self.destroy()
+                return "break"
+
+            hk, err = build_hotkey_from_event(sym, self._held_mods)
+            if hk is None:
+                self.status_var.set(f"{err}. Try another key.")
+                self.hk_var.set("press another key")
+                return "break"
+
+            self._save(hk)
+            return "break"
+
+        def _on_keyrelease(self, event):
+            sym = event.keysym
+            if sym in HELD_MOD_KEYSYMS:
+                mod = HELD_MOD_KEYSYMS[sym]
+                if mod in self._held_mods:
+                    self._held_mods.remove(mod)
+            return None
+
+        def _save(self, hk: str) -> None:
+            self.settings["hotkey"] = hk
+            save_settings(self.settings)
+            self.hk_var.set(pretty_hotkey(hk))
+            self.status_var.set("Saved. The menu bar app will rebind shortly.")
+            self.after(700, self.destroy)
+
+        def _clear(self) -> None:
+            self.settings["hotkey"] = ""
+            save_settings(self.settings)
+            self.hk_var.set("(not set)")
+            self.status_var.set("Hotkey cleared. Closing\u2026")
+            self.after(700, self.destroy)
+
+    Recorder().mainloop()
+
+
 # ===== settings window ===================================================
 
 def run_config_window() -> None:
@@ -641,78 +1150,6 @@ def run_config_window() -> None:
         from tkinter import ttk, messagebox
     except ImportError:
         sys.exit("tkinter not available. brew install python-tk@3.14")
-
-    # Tk keysyms for modifier keys (mapped to pynput hotkey names).
-    HELD_MOD_KEYSYMS = {
-        "Control_L": "ctrl", "Control_R": "ctrl",
-        "Shift_L": "shift", "Shift_R": "shift",
-        "Alt_L": "alt", "Alt_R": "alt",
-        "Option_L": "alt", "Option_R": "alt",
-        "Meta_L": "cmd", "Meta_R": "cmd",
-        "Command_L": "cmd", "Command_R": "cmd",
-        "Super_L": "cmd", "Super_R": "cmd",
-    }
-
-    # Multi-character Tk keysyms that map to pynput Key enum names.
-    # (Tk uses X11 legacy keysyms: "Prior" = page up, "Next" = page down.)
-    SPECIAL_KEYSYMS = {
-        "Escape": "esc",
-        "Return": "enter",
-        "BackSpace": "backspace",
-        "Tab": "tab",
-        "space": "space",
-        "Delete": "delete",
-        "Insert": "insert",
-        "Up": "up", "Down": "down", "Left": "left", "Right": "right",
-        "Home": "home", "End": "end",
-        "Prior": "page_up", "Next": "page_down",
-        "Page_Up": "page_up", "Page_Down": "page_down",
-        "Caps_Lock": "caps_lock",
-        "Num_Lock": "num_lock",
-        "Scroll_Lock": "scroll_lock",
-        "Pause": "pause",
-        "Print": "print_screen",
-        "Menu": "menu",
-        **{f"F{i}": f"f{i}" for i in range(1, 21)},
-    }
-
-    NUMPAD_CHARS = {
-        "KP_Add": "+", "KP_Subtract": "-", "KP_Multiply": "*",
-        "KP_Divide": "/", "KP_Decimal": ".", "KP_Equal": "=",
-    }
-
-    def keysym_to_token(keysym: str) -> str | None:
-        """Translate a Tk keysym to a pynput hotkey token, or None if unsupported."""
-        if keysym in SPECIAL_KEYSYMS:
-            return f"<{SPECIAL_KEYSYMS[keysym]}>"
-
-        # Numpad keys → equivalent regular key
-        if keysym.startswith("KP_"):
-            rest = keysym[3:]
-            if rest.isdigit():
-                return rest
-            if keysym in NUMPAD_CHARS:
-                return NUMPAD_CHARS[keysym]
-            if rest == "Enter":
-                return "<enter>"
-            if rest == "Space":
-                return "space"
-            return None
-
-        if len(keysym) == 1:
-            return keysym.lower()
-
-        # Unknown / unsupported keysym
-        return None
-
-    def validate_hotkey(hk: str) -> tuple[bool, str]:
-        """Return (ok, error_message) by attempting to parse with pynput."""
-        try:
-            from pynput.keyboard import HotKey
-            HotKey.parse(hk)
-            return True, ""
-        except Exception as e:
-            return False, str(e)
 
     class App(tk.Tk):
         PAD = 18
@@ -724,7 +1161,8 @@ def run_config_window() -> None:
             self.resizable(False, False)
 
             self.settings = load_settings()
-            layout, mb_x, mb_y = detect_state()
+            self.displays = find_displays()
+            layout, mb_x, mb_y = detect_state(self.displays)
             if layout == "above" and mb_x is not None:
                 self.settings["above_macbook_x"] = mb_x
             elif layout == "right" and mb_y is not None:
@@ -781,6 +1219,12 @@ def run_config_window() -> None:
 
             self.subtitle = ttk.Label(outer, text="", style="Sub.TLabel")
             self.subtitle.pack(anchor="w", pady=(8, 0))
+
+            self.displays_var = tk.StringVar()
+            ttk.Label(
+                outer, textvariable=self.displays_var, style="Hint.TLabel",
+                wraplength=460, justify="left",
+            ).pack(anchor="w", pady=(6, 0))
 
             ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=(14, 0))
 
@@ -929,12 +1373,51 @@ def run_config_window() -> None:
             self._refresh_hotkey_label()
             self._refresh_la_label()
             self._refresh_perm_label()
+            self._refresh_displays_label()
             self.after(2000, self._tick_perm)
+            self.after(2000, self._tick_displays)
+
+        # -- displays --------------------------------------------------
+
+        def _refresh_displays_label(self) -> None:
+            ds = self.displays
+            ext = ds.external
+            if ds.builtin is None and not ds.externals:
+                txt = "No displays detected."
+            elif ext is None:
+                txt = "Detected: built-in only \u2014 connect an external to enable layouts."
+            else:
+                b = ds.builtin
+                bdesc = (
+                    f"built-in {b.width}\u00d7{b.height}@{b.hertz}Hz"
+                    if b else "(no built-in?)"
+                )
+                edesc = f"external {ext.width}\u00d7{ext.height}@{ext.hertz}Hz"
+                extra = ""
+                if len(ds.externals) > 1:
+                    extra = f"  (+{len(ds.externals) - 1} more external)"
+                txt = f"Detected: {bdesc}  \u00b7  {edesc}{extra}"
+            self.displays_var.set(txt)
+
+        def _tick_displays(self) -> None:
+            new = find_displays()
+            if new.signature != self.displays.signature:
+                self.displays = new
+                self._refresh_displays_label()
+                # Re-render the current layout panel in case the external
+                # changed (height drives the "above" origin).
+                self._on_layout_change(apply=False)
+            self.after(2000, self._tick_displays)
 
         # -- layout / offset ------------------------------------------
 
         def _layout_meta(self) -> dict:
-            return make_layouts(self.settings)[self.current.get()]
+            layouts = make_layouts(self.settings, self.displays)
+            if layouts:
+                return layouts[self.current.get()]
+            # Fall back to metadata without args so the UI keeps working
+            # even when no external is connected.
+            return LAYOUT_META[self.current.get()]
 
         def _slider_int(self) -> int:
             return int(round(self.slider_var.get()))
@@ -999,9 +1482,16 @@ def run_config_window() -> None:
             name = self.current.get()
             ft = self._layout_meta()["fine_tune"]
             offset = self.settings[ft["settings_key"]]
+            self.displays = find_displays()
+            self._refresh_displays_label()
+            if not self.displays.is_ready:
+                self.status.configure(
+                    text="No external display connected \u2014 cannot apply layout."
+                )
+                return
             self.status.configure(text=f"Applying \u2018{name}\u2019\u2026")
             self.update_idletasks()
-            ok, msg = apply_layout(self.settings, name)
+            ok, msg = apply_layout(self.settings, name, self.displays)
             if ok:
                 self.status.configure(
                     text=f"Active: {name}  \u00b7  {ft['value_label']}={offset} px"
@@ -1053,26 +1543,9 @@ def run_config_window() -> None:
                 self._cancel_record()
                 return "break"
 
-            key_token = keysym_to_token(sym)
-            if key_token is None:
-                self.status.configure(
-                    text=f"Unsupported key: {sym!r} \u2014 try another"
-                )
-                self.hk_value_var.set(f"{sym}? press another key")
-                return "break"
-
-            mods = sorted(
-                set(self._held_mods),
-                key=lambda m: MOD_ORDER.index(m) if m in MOD_ORDER else 99,
-            )
-            mod_str = "+".join(f"<{m}>" for m in mods)
-            hk = f"{mod_str}+{key_token}" if mod_str else key_token
-
-            ok, err = validate_hotkey(hk)
-            if not ok:
-                self.status.configure(
-                    text=f"pynput can't bind {sym!r}: {err}"
-                )
+            hk, err = build_hotkey_from_event(sym, self._held_mods)
+            if hk is None:
+                self.status.configure(text=f"{err} \u2014 try another key")
                 self.hk_value_var.set("press another key")
                 return "break"
 
@@ -1160,6 +1633,8 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--config", action="store_true",
                        help="Open settings window")
+    group.add_argument("--record-hotkey", action="store_true",
+                       help="Open the standalone toggle-hotkey recorder")
     group.add_argument("--toggle", action="store_true",
                        help="Toggle layout once and exit")
     group.add_argument("--install-agent", action="store_true",
@@ -1174,13 +1649,18 @@ def main() -> None:
 
     if args.config:
         run_config_window()
+    elif args.record_hotkey:
+        run_hotkey_recorder()
     elif args.toggle:
         settings = load_settings()
-        current, _, _ = detect_state()
+        displays = find_displays()
+        if not displays.is_ready:
+            sys.exit("Toggle failed: no external display connected.")
+        current, _, _ = detect_state(displays)
         if current not in ("above", "right"):
             current = "above"
         new = "right" if current == "above" else "above"
-        ok, msg = apply_layout(settings, new)
+        ok, msg = apply_layout(settings, new, displays)
         if not ok:
             sys.exit(f"Toggle failed: {msg}")
         print(f"Switched to {new}")
