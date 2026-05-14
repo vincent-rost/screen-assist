@@ -8,7 +8,13 @@ saved layouts:
 
 Features:
 
-- Menu bar icon that always shows the active layout (▲ or ▶).
+- Menu bar icon that always shows the active layout (▲ or ▶, or ▫ when
+  no external is connected).
+- **Dynamic display detection** — works with whatever MacBook + external
+  is currently connected. No hardcoded UUIDs. Swap monitors freely; the
+  app picks up the change within ~2 seconds via polling, updates the
+  layouts to use the new screen's real resolution and refresh rate, and
+  posts a notification.
 - Per-layout fine-tune offset slider so you can align screens to their
   physical positions and stop the cursor from jumping when crossing.
 - Configurable global hotkey (`⌘⌥⌃R` by default) that toggles layouts.
@@ -32,12 +38,14 @@ cd /Users/vincentrost/Desktop/screen-setup
 .venv/bin/python screen_switcher.py
 ```
 
-A small ▲ or ▶ glyph appears in the menu bar. Click it to:
+A small ▲ or ▶ glyph appears in the menu bar (or ▫ when no external is
+connected). Click it to:
 
 - Switch directly to **Above** or **Right**
-- Use **Toggle** to flip
-- Open **Settings…** for the offset sliders, hotkey recorder, and
-  launch-agent toggle
+- Click **Toggle hotkey: …** to record a new global key combination
+  (the hotkey is the only "toggle" affordance — there's no on-screen
+  toggle button)
+- Open **Settings…** for the offset sliders and launch-agent toggle
 - **Quit**
 
 ## Settings window
@@ -96,13 +104,14 @@ To uninstall:
 ## CLI reference
 
 ```bash
-screen_switcher.py                # menu bar app (default)
-screen_switcher.py --config       # open settings window
-screen_switcher.py --toggle       # one-shot toggle, exits
+screen_switcher.py                  # menu bar app (default)
+screen_switcher.py --config         # open settings window
+screen_switcher.py --record-hotkey  # open just the toggle-hotkey recorder
+screen_switcher.py --toggle         # one-shot toggle, exits
 screen_switcher.py --install-agent
 screen_switcher.py --uninstall-agent
-screen_switcher.py --restart      # restart the launchd agent
-screen_switcher.py --status       # diagnostic dump (settings, perms, agent, log)
+screen_switcher.py --restart        # restart the launchd agent
+screen_switcher.py --status         # diagnostic dump (settings, perms, agent, log)
 ```
 
 `--toggle` is handy if you want to bind the toggle to a different
@@ -182,14 +191,22 @@ tail -f screen_switcher.log
 ls -lh screen_switcher.log
 ```
 
-## Display IDs
+## Displays
 
-Hardcoded near the top of `screen_switcher.py`:
+The app detects connected displays at runtime by parsing
+`displayplacer list`. It identifies the built-in MacBook screen by its
+`Type:` field (looking for "MacBook" / "built-in") and treats everything
+else as an external. There is **no hardcoded UUID** — you can switch
+HDMI dongles or plug in a different monitor and the layouts will rebuild
+automatically using the new screen's actual resolution and refresh rate.
 
-| Display          | Persistent ID                          |
-| ---------------- | -------------------------------------- |
-| External HDMI    | `DD110D51-7707-4A87-98E1-AEAA88626864` |
-| MacBook built-in | `37D8832A-2D66-02CA-B9F7-8F30A301B230` |
+If multiple externals are connected, the one with the
+lexicographically-smallest persistent ID is used as the primary; the
+others are listed in the menu and in `--status`. Hot-plug events are
+picked up by polling every 2 seconds.
 
-If you change monitor or HDMI dongle, run `displayplacer list` and
-update the constants.
+To inspect what the app sees, run:
+
+```bash
+.venv/bin/python screen_switcher.py --status
+```
